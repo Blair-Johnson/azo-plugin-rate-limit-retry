@@ -1,0 +1,30 @@
+[workspace]
+name = "agent-zoo-litellm-rate-limit-plugin"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64", "osx-64"]
+
+[dependencies]
+python = ">=3.11"
+
+[feature.test.dependencies]
+pexpect = ">=4.9"
+pyyaml = ">=6.0"
+tiktoken = ">=0.7"
+ripgrep = ">=15.1.0,<16"
+[feature.test.pypi-dependencies]
+pytest = ">=8"
+
+[feature.test.tasks]
+test = "python -m pytest"
+
+[environments]
+test = ["test"]
+
+[tool.agent-zoo.plugin]
+name = "litellm-rate-limit-retry"
+common = ["src/litellm_rate_limit_retry_plugin.py"]
+orchestrator = []
+executor = []
+
+[tool.agent-zoo.plugin.config]
+files = ["config/litellm_rate_limit_retry.json"]

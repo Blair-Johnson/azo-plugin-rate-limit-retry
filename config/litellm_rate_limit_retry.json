@@ -1,0 +1,8 @@
+{
+  "litellm_rate_limit_retry": {
+    "max_delay_seconds": 1200,
+    "tick_seconds": 1.0,
+    "max_captures": 64,
+    "emit_one_shot_notice": false
+  }
+}
