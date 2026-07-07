@@ -60,8 +60,6 @@ _RATE_LIMIT_TEXT_MARKERS = (
     "too-many-requests",
     "429",
     "x-ratelimit",
-    "retry-after",
-    "retry after",
     "requests per minute",
     "tokens per minute",
     "rpm",
@@ -385,20 +383,48 @@ def _rate_limit_signal(payload: dict[str, Any], evidence: _Evidence) -> str | No
         if any(marker.replace("_", "").replace("-", "") in compact for marker in _CLASS_MARKERS):
             return "exception-type"
 
-    header_names = " ".join(name.lower() for name, _value in evidence.headers)
-    if "retry-after" in header_names or "x-ratelimit" in header_names or "rate-limit-reset" in header_names:
-        return "rate-limit-header"
+    if _has_reset_header(evidence):
+        return "rate-limit-reset-header"
 
     text = "\n".join(evidence.texts).lower()
     has_rate_limit = any(marker in text for marker in _RATE_LIMIT_TEXT_MARKERS)
-    if not has_rate_limit:
-        return None
-
     phase = str(payload.get("phase") or "").lower()
     has_provider_context = any(marker in text for marker in _PROVIDER_TEXT_MARKERS) or "provider" in phase or "llm" in phase
-    if has_provider_context:
+    has_retry_after_header = _has_retry_after_header(evidence)
+
+    if has_rate_limit and (has_provider_context or has_retry_after_header):
         return "message"
+
+    # Retry-After is also valid for generic 503/service-maintenance responses.
+    # Treat it as rate-limit evidence only when paired with some LiteLLM/provider
+    # context and the event does not look like a generic server-side outage.
+    if has_retry_after_header and has_provider_context and not _looks_like_generic_retry_after(evidence.statuses, text):
+        return "retry-after-provider-context"
+
     return None
+
+
+def _has_retry_after_header(evidence: _Evidence) -> bool:
+    return any(_norm_key(name) in _RETRY_AFTER_KEYS for name, _value in evidence.headers)
+
+
+def _has_reset_header(evidence: _Evidence) -> bool:
+    return any(_norm_key(name).startswith(_RESET_HEADER_PREFIXES) for name, _value in evidence.headers)
+
+
+def _looks_like_generic_retry_after(statuses: Iterable[int], text: str) -> bool:
+    if any(status in {500, 502, 503, 504} for status in statuses):
+        return True
+    generic_markers = (
+        "maintenance",
+        "service unavailable",
+        "temporarily unavailable",
+        "gateway timeout",
+        "bad gateway",
+        "server error",
+        "503",
+    )
+    return any(marker in text for marker in generic_markers)
 
 
 def _headers_from(value: Any) -> list[tuple[str, Any]]:

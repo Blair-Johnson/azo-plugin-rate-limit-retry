@@ -53,14 +53,14 @@ Signals considered include:
 
 - HTTP/status code `429`
 - exception type names containing `RateLimit` or `TooManyRequests`
-- rate-limit headers such as `Retry-After` or `x-ratelimit-reset*`
+- rate-limit headers such as standard `RateLimit-Reset` / `ratelimit-reset` variants and provider `x-ratelimit-reset*` headers; `Retry-After` only when paired with other rate-limit/provider evidence
 - LiteLLM/OpenAI/Anthropic/provider-ish rate-limit text markers
 
 Deadline sources include:
 
 - `Retry-After` numeric seconds
 - `Retry-After` HTTP date
-- `x-ratelimit-reset*` relative seconds, epoch seconds/ms, ISO dates, HTTP dates, and duration strings such as `1m 30s`
+- standard `RateLimit-Reset` / `ratelimit-reset` and provider `x-ratelimit-reset*` relative seconds, epoch seconds/ms, ISO dates, HTTP dates, and duration strings such as `1m 30s`
 - JSON/body fields: `retry_after`, `retry_after_seconds`, `retry_after_ms`, `reset_at`, `resetAt`, `reset_time`
 - conservative text after a positive rate-limit signal, such as `retry after 42 seconds`, `try again in 1m 30s`, `reset in 12s`, and `reset at <date>`
 
@@ -91,10 +91,10 @@ The same defaults are included in `config/litellm_rate_limit_retry.json` and dec
 
 ## Test and inspect
 
-From this repo:
+From this repo, run the test Pixi task. It sets the local development `PYTHONPATH` for the harness API checkout plus this repo's `src` directory:
 
 ```bash
-PYTHONPATH=/home/bjohnson/Documents/GitHub/agent-utils-worktrees/harness-event-api/src:src python -m pytest
+pixi run -e test test
 ```
 
 Static source-file plugin inspection from the Agent Zoo development checkout:

@@ -66,6 +66,51 @@ def test_x_ratelimit_reset_header_formats(value, expected_delay):
     assert parsed.source == "header:x-ratelimit-reset-requests"
 
 
+
+def test_standard_ratelimit_reset_header_is_signal_and_deadline():
+    parsed = parse_rate_limit_deadline(
+        payload(message="LiteLLM provider response", headers={"RateLimit-Reset": "30"})
+    )
+
+    assert parsed is not None
+    assert parsed.deadline == pytest.approx(RUNTIME_NOW + 30)
+    assert parsed.source == "header:RateLimit-Reset"
+    assert parsed.signal == "rate-limit-reset-header"
+
+
+def test_standard_ratelimit_reset_lowercase_header_is_signal_and_deadline():
+    parsed = parse_rate_limit_deadline(
+        payload(message="LiteLLM provider response", headers={"ratelimit-reset": "45"})
+    )
+
+    assert parsed is not None
+    assert parsed.deadline == pytest.approx(RUNTIME_NOW + 45)
+    assert parsed.source == "header:ratelimit-reset"
+    assert parsed.signal == "rate-limit-reset-header"
+
+
+def test_bare_retry_after_header_is_ignored_for_generic_503_maintenance():
+    parsed = parse_rate_limit_deadline(
+        payload(
+            status_code=503,
+            message="LiteLLM provider service unavailable for maintenance",
+            headers={"Retry-After": "30"},
+        )
+    )
+
+    assert parsed is None
+
+
+def test_retry_after_header_with_provider_context_still_parses_when_not_generic_503():
+    parsed = parse_rate_limit_deadline(
+        payload(message="LiteLLM provider asked client to pause", headers={"Retry-After": "12"})
+    )
+
+    assert parsed is not None
+    assert parsed.deadline == pytest.approx(RUNTIME_NOW + 12)
+    assert parsed.signal == "retry-after-provider-context"
+
+
 def test_body_retry_after_ms_field():
     parsed = parse_rate_limit_deadline(
         payload(

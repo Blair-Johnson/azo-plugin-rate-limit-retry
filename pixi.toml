@@ -15,7 +15,7 @@ ripgrep = ">=15.1.0,<16"
 pytest = ">=8"
 
 [feature.test.tasks]
-test = "python -m pytest"
+test = "PYTHONPATH=/home/bjohnson/Documents/GitHub/agent-utils-worktrees/harness-event-api/src:src python -m pytest"
 
 [environments]
 test = ["test"]
