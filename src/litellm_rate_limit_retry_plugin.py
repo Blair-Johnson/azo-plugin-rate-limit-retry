@@ -7,8 +7,6 @@ behavior when it can confidently identify a rate-limit error and parse a retry
 or reset deadline.
 """
 
-from __future__ import annotations
-
 import datetime as _dt
 import email.utils
 import json
@@ -36,6 +34,7 @@ _RESET_HEADER_PREFIXES = (
     "ratelimit_reset",
     "rate_limit_reset",
 )
+_STATUS_KEYS = {"status", "status_code", "statuscode", "http_status", "httpstatus", "http_status_code", "httpstatuscode", "code"}
 _BODY_DEADLINE_KEYS = {
     "retry_after",
     "retryafter",
@@ -84,17 +83,23 @@ _CLASS_MARKERS = (
     "too-many-requests",
 )
 _DURATION_TOKEN_RE = re.compile(
-    r"(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)",
+    r"(?P<num>\d+(?:\.\d+)?)\s*(?P<unit>milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b",
     re.IGNORECASE,
 )
+_DURATION_VALUE_RE = re.compile(
+    r"^\s*(?:\d+(?:\.\d+)?\s*(?:milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b\s*)+$",
+    re.IGNORECASE,
+)
+_TEXT_DURATION_VALUE_RE = r"(?:\d+(?:\.\d+)?\s*(?:milliseconds?|msecs?|ms|seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h)\b\s*)+|\d+(?:\.\d+)?(?!\s*[A-Za-z])(?![,.:]\d)"
 _TEXT_DURATION_PATTERNS = (
-    re.compile(r"\bretry\s*-?\s*after\s*:?[\s=]+(?P<value>[^.;,\n]+)", re.IGNORECASE),
-    re.compile(r"\btry\s+again\s+in\s+(?P<value>[^.;,\n]+)", re.IGNORECASE),
-    re.compile(r"\breset\s+in\s+(?P<value>[^.;,\n]+)", re.IGNORECASE),
+    re.compile(rf"\bretry\s*-?\s*after\s*:?[\s=]+(?P<value>{_TEXT_DURATION_VALUE_RE})", re.IGNORECASE),
+    re.compile(rf"\btry\s+again\s+in\s+(?P<value>{_TEXT_DURATION_VALUE_RE})", re.IGNORECASE),
+    re.compile(rf"\breset\s+in\s+(?P<value>{_TEXT_DURATION_VALUE_RE})", re.IGNORECASE),
 )
 _TEXT_DATE_PATTERNS = (
-    re.compile(r"\breset\s+at\s+(?P<value>[^;\n]+)", re.IGNORECASE),
-    re.compile(r"\bretry\s*-?\s*after\s+(?P<value>[A-Z][a-z]{2},\s+[^;\n]+)", re.IGNORECASE),
+    re.compile(r"\bresets?\s+at\s*:?\s*(?P<value>[^;\n]+)", re.IGNORECASE),
+    re.compile(r"\blimit\s+resets?\s+at\s*:?\s*(?P<value>[^;\n]+)", re.IGNORECASE),
+    re.compile(r"\bretry\s*-?\s*after\s*:?\s*(?P<value>[A-Z][a-z]{2},\s+[^;\n]+)", re.IGNORECASE),
 )
 
 
@@ -314,10 +319,11 @@ def _collect_evidence(payload: dict[str, Any]) -> _Evidence:
             if stripped:
                 texts.append(stripped)
 
-    for key in ("status_code", "status", "http_status", "http_status_code"):
-        status = _safe_int(payload.get(key))
-        if status is not None:
-            statuses.append(status)
+    for key, item in payload.items():
+        if _norm_key(key) in _STATUS_KEYS:
+            status = _safe_int(item)
+            if status is not None:
+                statuses.append(status)
 
     exc_type = str(payload.get("exception_type") or "")
     if exc_type:
@@ -339,21 +345,16 @@ def _collect_evidence(payload: dict[str, Any]) -> _Evidence:
             json_func = getattr(response, "json", None)
             if callable(json_func):
                 try:
-                    _collect_body_fields(json_func(), body_fields, texts)
+                    _collect_body_fields(json_func(), body_fields, texts, statuses=statuses, headers=headers)
                 except Exception:
                     pass
         for attr in ("headers", "response_headers"):
             headers.extend(_headers_from(getattr(exception, attr, None)))
         for attr in ("body", "json_body", "provider_payload", "payload"):
-            _collect_body_fields(getattr(exception, attr, None), body_fields, texts)
+            _collect_body_fields(getattr(exception, attr, None), body_fields, texts, statuses=statuses, headers=headers)
         add_text(str(exception))
 
-    for key in ("headers", "response_headers"):
-        headers.extend(_headers_from(payload.get(key)))
-    for key in ("message", "display_message", "detail", "traceback_text"):
-        add_text(payload.get(key))
-    for key in ("provider_payload", "body", "response", "error", "json"):
-        _collect_body_fields(payload.get(key), body_fields, texts)
+    _collect_body_fields(payload, body_fields, texts, statuses=statuses, headers=headers)
 
     # Dedupe while preserving order.
     seen_headers = set()
@@ -443,8 +444,16 @@ def _headers_from(value: Any) -> list[tuple[str, Any]]:
     return result
 
 
-def _collect_body_fields(value: Any, body_fields: list[tuple[str, Any]], texts: list[str], *, depth: int = 0) -> None:
-    if value is None or depth > 4:
+def _collect_body_fields(
+    value: Any,
+    body_fields: list[tuple[str, Any]],
+    texts: list[str],
+    *,
+    depth: int = 0,
+    statuses: list[int] | None = None,
+    headers: list[tuple[str, Any]] | None = None,
+) -> None:
+    if value is None or depth > 8:
         return
     if isinstance(value, (bytes, bytearray)):
         try:
@@ -458,23 +467,32 @@ def _collect_body_fields(value: Any, body_fields: list[tuple[str, Any]], texts: 
         texts.append(stripped)
         if stripped[:1] in "[{":
             try:
-                _collect_body_fields(json.loads(stripped), body_fields, texts, depth=depth + 1)
+                _collect_body_fields(
+                    json.loads(stripped), body_fields, texts, depth=depth + 1, statuses=statuses, headers=headers
+                )
             except Exception:
                 pass
         return
     if isinstance(value, dict):
         for key, item in value.items():
             key_text = str(key)
-            if _norm_key(key_text) in _BODY_DEADLINE_KEYS:
+            normalized_key = _norm_key(key_text)
+            if normalized_key in _BODY_DEADLINE_KEYS:
                 body_fields.append((key_text, item))
+            if headers is not None and normalized_key in {"headers", "response_headers"}:
+                headers.extend(_headers_from(item))
+            if statuses is not None and normalized_key in _STATUS_KEYS:
+                status = _safe_int(item)
+                if status is not None and 100 <= status <= 599:
+                    statuses.append(status)
             if key_text.lower() in {"message", "detail", "error", "type", "code"}:
                 if isinstance(item, str):
                     texts.append(item)
-            _collect_body_fields(item, body_fields, texts, depth=depth + 1)
+            _collect_body_fields(item, body_fields, texts, depth=depth + 1, statuses=statuses, headers=headers)
         return
     if isinstance(value, (list, tuple)):
         for item in value[:20]:
-            _collect_body_fields(item, body_fields, texts, depth=depth + 1)
+            _collect_body_fields(item, body_fields, texts, depth=depth + 1, statuses=statuses, headers=headers)
 
 
 def _parse_retry_after_value(value: Any, runtime_now: float, wall_time: float, max_delay: float) -> float | None:
@@ -552,10 +570,11 @@ def _parse_duration_seconds(value: Any) -> float | None:
     if numeric is not None:
         return numeric
 
+    if _DURATION_VALUE_RE.fullmatch(text) is None:
+        return None
+
     total = 0.0
-    matched = False
     for match in _DURATION_TOKEN_RE.finditer(text):
-        matched = True
         number = float(match.group("num"))
         unit = match.group("unit").lower()
         if unit.startswith("ms") or unit.startswith("millisecond") or unit.startswith("msec"):
@@ -566,9 +585,7 @@ def _parse_duration_seconds(value: Any) -> float | None:
             total += number * 60.0
         elif unit.startswith("h"):
             total += number * 3600.0
-    if matched:
-        return total
-    return None
+    return total
 
 
 def _deadline_from_date(value: str, runtime_now: float, wall_time: float, max_delay: float) -> float | None:
@@ -583,28 +600,45 @@ def _parse_wall_epoch(value: str) -> float | None:
     if not text:
         return None
 
-    # Trim common trailing prose/punctuation without damaging RFC 7231 dates.
-    text = re.sub(r"\s+(?:utc|gmt)?\s*(?:[).,]+)?$", lambda m: m.group(0).rstrip(".,)"), text, flags=re.IGNORECASE).strip()
+    candidates = [text]
+    iso_match = re.search(
+        r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:\s*(?:Z|UTC|GMT)|[+-]\d{2}:?\d{2})?",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if iso_match:
+        candidates.append(iso_match.group(0))
 
-    try:
-        dt = email.utils.parsedate_to_datetime(text)
-        if dt is not None:
+    for candidate in candidates:
+        # Trim common trailing prose/punctuation without damaging RFC 7231 dates.
+        candidate = re.sub(
+            r"\s+(?:utc|gmt)?\s*(?:[).,]+)?$",
+            lambda m: m.group(0).rstrip(".,)"),
+            candidate,
+            flags=re.IGNORECASE,
+        ).strip()
+
+        try:
+            dt = email.utils.parsedate_to_datetime(candidate)
+            if dt is not None:
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_dt.timezone.utc)
+                return dt.timestamp()
+        except Exception:
+            pass
+
+        iso_text = candidate
+        if iso_text.endswith("Z"):
+            iso_text = iso_text[:-1] + "+00:00"
+        iso_text = re.sub(r"\s+(?:utc|gmt)$", "+00:00", iso_text, flags=re.IGNORECASE)
+        try:
+            dt = _dt.datetime.fromisoformat(iso_text)
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=_dt.timezone.utc)
             return dt.timestamp()
-    except Exception:
-        pass
-
-    iso_text = text
-    if iso_text.endswith("Z"):
-        iso_text = iso_text[:-1] + "+00:00"
-    try:
-        dt = _dt.datetime.fromisoformat(iso_text)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=_dt.timezone.utc)
-        return dt.timestamp()
-    except Exception:
-        return None
+        except Exception:
+            pass
+    return None
 
 
 def _deadline_from_relative(seconds: float, runtime_now: float, max_delay: float) -> float | None:

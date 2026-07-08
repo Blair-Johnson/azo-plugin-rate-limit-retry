@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import datetime as dt
+import importlib.util
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -89,6 +91,17 @@ def test_standard_ratelimit_reset_lowercase_header_is_signal_and_deadline():
     assert parsed.signal == "rate-limit-reset-header"
 
 
+def test_retry_after_http_date_with_month_name_is_not_parsed_as_duration_prefix():
+    http_date = "Fri, 01 May 2026 12:00:00 GMT"
+    payload_wall_time = dt.datetime(2026, 5, 1, 11, 58, 30, tzinfo=dt.timezone.utc).timestamp()
+
+    parsed = parse_rate_limit_deadline(
+        payload(status_code=429, wall_time=payload_wall_time, headers={"Retry-After": http_date})
+    )
+
+    assert parsed is not None
+    assert parsed.deadline == pytest.approx(RUNTIME_NOW + 90)
+    assert parsed.source == "header:Retry-After"
 def test_bare_retry_after_header_is_ignored_for_generic_503_maintenance():
     parsed = parse_rate_limit_deadline(
         payload(
@@ -124,6 +137,104 @@ def test_body_retry_after_ms_field():
     assert parsed.source == "body:retry_after_ms"
 
 
+def test_nested_error_code_429_and_limit_resets_at_utc_message():
+    wall_deadline = WALL_TIME + 60
+    reset_text = dt.datetime.fromtimestamp(wall_deadline, tz=dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    parsed = parse_rate_limit_deadline(
+        payload(
+            phase="runtime",
+            message="",
+            error={
+                "code": "429",
+                "message": (
+                    "Rate limit exceeded for model_per_key: demo. Limit type: requests. "
+                    f"Current limit: 4, Remaining: 0. Limit resets at: {reset_text}"
+                ),
+                "param": None,
+                "type": "None",
+            },
+        )
+    )
+
+    assert parsed is not None
+    assert parsed.deadline == pytest.approx(RUNTIME_NOW + 60)
+    assert parsed.source == "text"
+    assert parsed.signal == "status:429"
+
+
+def test_top_level_payload_error_code_429_and_limit_resets_at_utc_message():
+    wall_deadline = WALL_TIME + 75
+    reset_text = dt.datetime.fromtimestamp(wall_deadline, tz=dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    parsed = parse_rate_limit_deadline(
+        payload(
+            phase="runtime",
+            message="",
+            payload={
+                "error": {
+                    "code": "429",
+                    "message": (
+                        "Rate limit exceeded for model_per_key: demo. Limit type: requests. "
+                        f"Current limit: 4, Remaining: 0. Limit resets at: {reset_text}"
+                    ),
+                    "param": None,
+                    "type": "None",
+                }
+            },
+        )
+    )
+
+    assert parsed is not None
+    assert parsed.deadline == pytest.approx(RUNTIME_NOW + 75)
+    assert parsed.source == "text"
+    assert parsed.signal == "status:429"
+
+def test_recursively_finds_rate_limit_reset_in_unknown_envelope_shape():
+    wall_deadline = WALL_TIME + 90
+    reset_text = dt.datetime.fromtimestamp(wall_deadline, tz=dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    parsed = parse_rate_limit_deadline(
+        payload(
+            phase="runtime",
+            message="",
+            arbitrary_wrapper={
+                "events": [
+                    {
+                        "metadata": {"code": "429"},
+                        "diagnostic_blob": (
+                            "provider failed: Limit resets at: "
+                            f"{reset_text}', 'type': 'None', 'param': None"
+                        ),
+                    }
+                ]
+            },
+        )
+    )
+
+    assert parsed is not None
+    assert parsed.deadline == pytest.approx(RUNTIME_NOW + 90)
+    assert parsed.source == "text"
+    assert parsed.signal == "status:429"
+
+
+def test_recursively_finds_camel_case_status_code_signal():
+    reset_at = dt.datetime.fromtimestamp(WALL_TIME + 33, tz=dt.timezone.utc).isoformat()
+
+    parsed = parse_rate_limit_deadline(
+        payload(
+            phase="runtime",
+            message="",
+            arbitrary_wrapper={"statusCode": 429, "details": {"resetAt": reset_at}},
+        )
+    )
+
+    assert parsed is not None
+    assert parsed.deadline == pytest.approx(RUNTIME_NOW + 33)
+    assert parsed.source == "body:resetAt"
+    assert parsed.signal == "status:429"
+
+
 def test_body_reset_at_iso_field():
     reset_at = dt.datetime.fromtimestamp(WALL_TIME + 17, tz=dt.timezone.utc).isoformat()
 
@@ -139,6 +250,46 @@ def test_text_try_again_in_duration_requires_rate_limit_signal():
 
     assert parsed is not None
     assert parsed.deadline == pytest.approx(RUNTIME_NOW + 90)
+
+
+def test_text_retry_after_http_date_accepts_header_like_colon_separator():
+    http_date = "Fri, 01 May 2026 12:00:00 GMT"
+    payload_wall_time = dt.datetime(2026, 5, 1, 11, 58, 30, tzinfo=dt.timezone.utc).timestamp()
+
+    parsed = parse_rate_limit_deadline(
+        payload(
+            wall_time=payload_wall_time,
+            message=f"LiteLLM RateLimitError: Retry-After: {http_date}",
+        )
+    )
+
+    assert parsed is not None
+    assert parsed.deadline == pytest.approx(RUNTIME_NOW + 90)
+    assert parsed.source == "text"
+
+
+def test_text_retry_duration_keeps_decimal_seconds():
+    parsed = parse_rate_limit_deadline(payload(message="LiteLLM RateLimitError: try again in 1.5s"))
+
+    assert parsed is not None
+    assert parsed.deadline == pytest.approx(RUNTIME_NOW + 1.5)
+
+    parsed = parse_rate_limit_deadline(payload(message="LiteLLM RateLimitError: retry after: 0.25 seconds"))
+
+    assert parsed is not None
+    assert parsed.deadline == pytest.approx(RUNTIME_NOW + 0.25)
+
+
+def test_text_duration_does_not_parse_unit_prefix_inside_word():
+    parsed = parse_rate_limit_deadline(payload(message="LiteLLM RateLimitError: try again in 1 month"))
+
+    assert parsed is None
+
+
+
+def test_text_duration_does_not_parse_partial_number_before_punctuation():
+    assert parse_rate_limit_deadline(payload(message="LiteLLM RateLimitError: try again in 1,000 seconds")) is None
+    assert parse_rate_limit_deadline(payload(message="LiteLLM RateLimitError: retry after: 2,500 ms")) is None
 
 
 def test_text_retry_deadline_ignored_without_positive_rate_limit_signal():
@@ -241,6 +392,22 @@ def test_wait_tick_for_unknown_source_event_is_ignored():
     tick = HarnessEvent("evt-2", "runtime.wait.tick", 2, {"source_event_id": "missing", "remaining_seconds": 3})
 
     assert handler.handle_harness_event(tick, state) is None
+
+
+def test_plugin_imports_with_agent_zoo_file_loader_style():
+    module_name = "agent_zoo_plugin_loader_regression"
+    source_path = sys.modules[parse_rate_limit_deadline.__module__].__file__
+    spec = importlib.util.spec_from_file_location(module_name, source_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.modules.pop(module_name, None)
+
+    assert module.PLUGIN_NAME == "litellm_rate_limit_retry"
 
 
 def test_register_features_adds_named_feature():
