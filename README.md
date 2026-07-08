@@ -6,14 +6,7 @@ It is a source-file plugin: the live file is `src/litellm_rate_limit_retry_plugi
 
 ## Install
 
-From a local checkout:
-
-```bash
-azo-plugin install /home/bjohnson/Documents/GitHub/agent-zoo-litellm-rate-limit-plugin --dry-run
-azo-plugin install /home/bjohnson/Documents/GitHub/agent-zoo-litellm-rate-limit-plugin
-```
-
-From a git URL after publishing:
+From a git URL:
 
 ```bash
 azo-plugin install https://github.com/<you>/agent-zoo-litellm-rate-limit-plugin.git
