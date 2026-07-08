@@ -9,7 +9,7 @@ It is a source-file plugin: the live file is `src/litellm_rate_limit_retry_plugi
 From a git URL:
 
 ```bash
-azo-plugin install https://github.com/<you>/agent-zoo-litellm-rate-limit-plugin.git
+azo-plugin install https://github.com/Blair-Johnson/azo-plugin-rate-limit-retry.git
 ```
 
 Then reload the Agent Zoo backend/TUI:
@@ -18,7 +18,7 @@ Then reload the Agent Zoo backend/TUI:
 /reload
 ```
 
-Use `azo-plugin list` to confirm installation and `azo-plugin uninstall litellm-rate-limit-retry` to remove it.
+Use `azo-plugin list` to confirm installation and `azo-plugin uninstall azo-plugin-rate-limit-retry` to remove it.
 
 ## Behavior
 
@@ -101,7 +101,7 @@ python /home/bjohnson/Documents/GitHub/agent-zoo-worktrees/harness-event-api-des
 Dry-run install validation without touching your live Agent Zoo plugin state:
 
 ```bash
-REPO=/home/bjohnson/Documents/GitHub/agent-zoo-litellm-rate-limit-plugin
+REPO=$(pwd)
 TMP_STATE=$(mktemp -d)
 cd /home/bjohnson/Documents/GitHub/agent-zoo-worktrees/harness-event-api-design
 AGENT_ZOO_STATE_ROOT="$TMP_STATE" \
