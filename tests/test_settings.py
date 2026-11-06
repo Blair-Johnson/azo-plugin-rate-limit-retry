@@ -1,8 +1,10 @@
-"""Read-only effective settings, through the actual pipeline and registry."""
+"""Saved defaults, through the actual pipeline and registry."""
+import json
+
 from agent_utils import PipelineBuilder, Session
 from agent_utils.builder import flatten
 from agent_zoo.runtime.settings import Setting, SettingsContext, SettingsRegistry
-from litellm_rate_limit_retry_plugin import register_features
+from litellm_rate_limit_retry_plugin import register_features, _defaults_path
 
 
 def catalog(config):
@@ -17,7 +19,8 @@ def catalog(config):
     return registry, ctx, result["settings"]
 
 
-def test_defaults_readonly_and_no_host_config_mutation():
+def test_defaults_writable_and_no_host_config_mutation(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_ZOO_HOME", str(tmp_path))
     config = {"unrelated": {"prompt": "untouched"}}
     registry, ctx, rows = catalog(config)
     assert {r["key"]: r["value"] for r in rows} == {
@@ -26,22 +29,29 @@ def test_defaults_readonly_and_no_host_config_mutation():
         "rate_limit_retry.max_captures": 64,
         "rate_limit_retry.emit_one_shot_notice": False,
     }
-    assert all(not r["writable"] and r["apply"] == "reload" for r in rows)
+    assert all(r["writable"] and r["apply"] == "reload" for r in rows)
     result = registry.handle({"type": "plugin_settings", "action": "set", "request_id": "write",
                               "binding": registry.binding, "key": "rate_limit_retry.tick_ms", "value": 1500}, ctx)
-    assert not result["ok"]
+    assert result["ok"]
+    assert json.loads(_defaults_path().read_text())["litellm_rate_limit_retry"]["tick_seconds"] == 1.5
     assert config == {"unrelated": {"prompt": "untouched"}}
 
 
-def test_reload_fractional_seconds_exact_or_error():
-    config = {"litellm_rate_limit_retry": {"tick_seconds": 0.125, "max_delay_seconds": 12.345,
-                                           "max_captures": 7, "emit_one_shot_notice": True}}
-    _, _, rows = catalog(config)
+def test_reload_fractional_seconds_exact_or_error(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENT_ZOO_HOME", str(tmp_path))
+    saved = {"litellm_rate_limit_retry": {"tick_seconds": 0.125, "max_delay_seconds": 12.345,
+                                         "max_captures": 7, "emit_one_shot_notice": True}}
+    path = _defaults_path()
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps(saved))
+    override = {"litellm_rate_limit_retry": {"tick_seconds": 99}}
+    _, _, rows = catalog(override)
     assert {r["key"]: r["value"] for r in rows} == {
         "rate_limit_retry.max_delay_ms": 12345, "rate_limit_retry.tick_ms": 125,
         "rate_limit_retry.max_captures": 7, "rate_limit_retry.emit_one_shot_notice": True,
     }
-    config["litellm_rate_limit_retry"]["tick_seconds"] = 0.0001
-    _, _, rows = catalog(config)
+    saved["litellm_rate_limit_retry"]["tick_seconds"] = 0.0001
+    path.write_text(json.dumps(saved))
+    _, _, rows = catalog(override)
     tick = next(r for r in rows if r["key"].endswith("tick_ms"))
     assert tick["value"] is None and tick["error"]

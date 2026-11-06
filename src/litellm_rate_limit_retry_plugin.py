@@ -11,14 +11,18 @@ import datetime as _dt
 import email.utils
 import json
 import math
+import os
+import tempfile
 import re
 import time
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any, Iterable
 
 from agent_utils import Feature
 from agent_zoo.runtime.settings import Setting, SettingError
+from agent_zoo.projects import resolve_state_root
 from agent_utils.components import HarnessEventHandler
 from agent_utils.harness_events import HarnessControl, HarnessDecision, HarnessEffect, WakeSpec
 
@@ -115,41 +119,99 @@ class DeadlineParse:
     signal: str
 
 
+def _defaults_path() -> Path:
+    return (resolve_state_root() / "plugin-configs" / "azo-plugin-rate-limit-retry"
+            / "config" / "litellm_rate_limit_retry.json")
+
+
+def _saved_document():
+    try:
+        path = _defaults_path().resolve()
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            document = {}
+        if not isinstance(document, dict) or not isinstance(document.get(PLUGIN_NAME, {}), dict):
+            raise ValueError
+        return path, document
+    except Exception:
+        raise SettingError("Cannot read retry defaults; repair the file before editing.") from None
+
+
+def _saved_setting(field, default, value=None):
+    path, document = _saved_document()
+    duration = field in {"max_delay_seconds", "tick_seconds"}
+    if value is None:
+        raw = document.get(PLUGIN_NAME, {}).get(field, default)
+        if type(default) is bool:
+            if type(raw) is not bool:
+                raise SettingError("Retry notice default must be a boolean.")
+            return raw
+        try:
+            number = Decimal(str(raw)) * (1000 if duration else 1)
+            if (not number.is_finite() or number != number.to_integral_value()
+                    or not 1 <= number <= 2**63 - 1):
+                raise ValueError
+            return int(number)
+        except (InvalidOperation, ValueError):
+            raise SettingError("Retry default must be a positive exact integer (milliseconds for durations).") from None
+    if type(default) is bool:
+        if type(value) is not bool:
+            raise SettingError("Retry notice default must be a boolean.")
+        stored = value
+    else:
+        if type(value) is not int or not 1 <= value <= 2**63 - 1:
+            raise SettingError("Retry default must be a positive bounded integer.")
+        stored = value / 1000 if duration else value
+        if duration and Decimal(str(stored)) * 1000 != value:
+            raise SettingError("Retry duration cannot be saved as exact milliseconds.")
+    document.setdefault(PLUGIN_NAME, {})[field] = stored
+    temporary = None
+    try:
+        text = json.dumps(document, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mode = path.stat().st_mode & 0o7777 if path.exists() else 0o600
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=".retry-settings-", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(text)
+        temporary.chmod(mode)
+        os.replace(temporary, path)
+    except Exception:
+        raise SettingError("Cannot save retry defaults.") from None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def register_features(builder, *, session, config):
-    """Register the common-scope harness event handler feature."""
-
-    cfg = _plugin_config(config)
+    """Register saved defaults separately from runtime configuration overrides."""
+    try:
+        _, document = _saved_document()
+        cfg = dict(document.get(PLUGIN_NAME, {}))
+    except SettingError:
+        # Keep retry available; /config reports the unreadable file without overwriting it.
+        cfg = {}
+    cfg.update(_plugin_config(config))
     handler = LiteLLMRateLimitRetryHandler(cfg)
-
-    def milliseconds(seconds):
-        value = Decimal(str(seconds)) * 1000
-        if value != value.to_integral_value() or not 1 <= value <= 2**63 - 1:
-            raise SettingError("This duration cannot be represented as exact integer milliseconds.")
-        return int(value)
-
-    help_text = ("Read-only effective value from main harness config (litellm_rate_limit_retry). "
-                 "Edit that config and reload; this plugin owns no writable config path.")
-    builder.add(Feature(name="litellm_rate_limit_retry_settings", components=[
-        Setting("rate_limit_retry.max_delay_ms", "Maximum retry delay (ms)", "int",
-                lambda ctx: milliseconds(handler.max_delay_seconds), min=1, max=2**63 - 1,
-                group="Rate limit retry", help=help_text, apply="reload"),
-        Setting("rate_limit_retry.tick_ms", "Countdown interval (ms)", "int",
-                lambda ctx: milliseconds(handler.tick_seconds), min=1, max=2**63 - 1,
-                group="Rate limit retry", help=help_text, apply="reload"),
-        Setting("rate_limit_retry.max_captures", "Maximum captured errors", "int",
-                lambda ctx: handler.max_captures, min=1, max=2**63 - 1,
-                group="Rate limit retry", help=help_text, apply="reload"),
-        Setting("rate_limit_retry.emit_one_shot_notice", "Emit one-shot notice", "bool",
-                lambda ctx: handler.emit_one_shot_notice,
-                group="Rate limit retry", help=help_text, apply="reload"),
-    ], order=[Setting]))
-    builder.add(
-        Feature(
-            name=PLUGIN_NAME,
-            components=[handler],
-            order=[HarnessEventHandler],
-        )
-    )
+    settings = []
+    for key, field, label, default in (
+        ("max_delay_ms", "max_delay_seconds", "Maximum retry delay (ms)", DEFAULT_MAX_DELAY_SECONDS),
+        ("tick_ms", "tick_seconds", "Countdown interval (ms)", DEFAULT_TICK_SECONDS),
+        ("max_captures", "max_captures", "Maximum captured errors", DEFAULT_MAX_CAPTURES),
+        ("emit_one_shot_notice", "emit_one_shot_notice", "Emit one-shot notice", DEFAULT_EMIT_ONE_SHOT_NOTICE),
+    ):
+        kind = "bool" if type(default) is bool else "int"
+        settings.append(Setting(
+            "rate_limit_retry." + key, label, kind,
+            get=lambda ctx, f=field, d=default: _saved_setting(f, d),
+            set=lambda ctx, value, f=field, d=default: _saved_setting(f, d, value),
+            group="Rate limit retry", apply="reload",
+            help="Saved plugin default; reload to apply. Explicit runtime configuration takes precedence.",
+            **({"min": 1, "max": 2**63 - 1} if kind == "int" else {}),
+        ))
+    builder.add(Feature(name="litellm_rate_limit_retry_settings", components=settings, order=[Setting]))
+    builder.add(Feature(name=PLUGIN_NAME, components=[handler], order=[HarnessEventHandler]))
 
 
 class LiteLLMRateLimitRetryHandler(HarnessEventHandler):

@@ -78,7 +78,7 @@ Safe defaults are built into the plugin:
 }
 ```
 
-The same defaults are included in `config/litellm_rate_limit_retry.json` and declared in `pixi.toml` so `azo-plugin install` can copy it to the plugin config area. Current Agent Zoo userspace plugin loading passes the main harness config to `register_features`; if you merge the JSON under the same key into that config, the plugin will honor it. Missing config is safe.
+The same defaults are included in `config/litellm_rate_limit_retry.json` and installed under `<state-home>/plugin-configs/azo-plugin-rate-limit-retry/config/`. The plugin reads that file for its saved defaults. Explicit main harness configuration takes precedence in the running session; `/config` always edits the plugin's saved defaults, not that override. Missing config uses the built-in defaults.
 
 `max_delay_seconds` is intentionally bounded (default 20 minutes). Longer parsed provider deadlines are ignored so default policy can take over instead of silently parking a session for an unexpectedly long time.
 
@@ -121,15 +121,9 @@ Note: the current development installer prepares a managed source checkout befor
 
 ## `/config` settings
 
-The plugin exposes read-only effective maximum delay and countdown interval
+The plugin exposes editable saved defaults for maximum delay and countdown interval
 (integer milliseconds), maximum captured errors (integer), and one-shot notice
-(boolean). Edit `litellm_rate_limit_retry` in the main harness config and reload
-to change them. Durations that are not exact integer milliseconds display a safe
-error rather than being rounded. Capture count reflects the handler's existing
-normalization, not a new conversion.
-
-The installed JSON is a configuration example: the current plugin does not read
-it at runtime. No writable rows are offered because the plugin has no authoritative
-plugin-owned persistence path; `/config` must not silently edit main harness
-configuration or create a second configuration source. No defaults or behavior
-change until the existing harness configuration is edited and reloaded.
+(boolean). Changes are saved to the installed plugin JSON and apply after backend
+reload. Explicit runtime overrides remain unchanged. Durations that are not exact
+integer milliseconds display an error rather than being rounded. Unrelated JSON
+values are preserved; malformed files are not overwritten.
