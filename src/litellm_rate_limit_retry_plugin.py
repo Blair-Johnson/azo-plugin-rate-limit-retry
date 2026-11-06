@@ -14,9 +14,11 @@ import math
 import re
 import time
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Any, Iterable
 
 from agent_utils import Feature
+from agent_zoo.runtime.settings import Setting, SettingError
 from agent_utils.components import HarnessEventHandler
 from agent_utils.harness_events import HarnessControl, HarnessDecision, HarnessEffect, WakeSpec
 
@@ -117,10 +119,34 @@ def register_features(builder, *, session, config):
     """Register the common-scope harness event handler feature."""
 
     cfg = _plugin_config(config)
+    handler = LiteLLMRateLimitRetryHandler(cfg)
+
+    def milliseconds(seconds):
+        value = Decimal(str(seconds)) * 1000
+        if value != value.to_integral_value() or not 1 <= value <= 2**63 - 1:
+            raise SettingError("This duration cannot be represented as exact integer milliseconds.")
+        return int(value)
+
+    help_text = ("Read-only effective value from main harness config (litellm_rate_limit_retry). "
+                 "Edit that config and reload; this plugin owns no writable config path.")
+    builder.add(Feature(name="litellm_rate_limit_retry_settings", components=[
+        Setting("rate_limit_retry.max_delay_ms", "Maximum retry delay (ms)", "int",
+                lambda ctx: milliseconds(handler.max_delay_seconds), min=1, max=2**63 - 1,
+                group="Rate limit retry", help=help_text, apply="reload"),
+        Setting("rate_limit_retry.tick_ms", "Countdown interval (ms)", "int",
+                lambda ctx: milliseconds(handler.tick_seconds), min=1, max=2**63 - 1,
+                group="Rate limit retry", help=help_text, apply="reload"),
+        Setting("rate_limit_retry.max_captures", "Maximum captured errors", "int",
+                lambda ctx: handler.max_captures, min=1, max=2**63 - 1,
+                group="Rate limit retry", help=help_text, apply="reload"),
+        Setting("rate_limit_retry.emit_one_shot_notice", "Emit one-shot notice", "bool",
+                lambda ctx: handler.emit_one_shot_notice,
+                group="Rate limit retry", help=help_text, apply="reload"),
+    ], order=[Setting]))
     builder.add(
         Feature(
             name=PLUGIN_NAME,
-            components=[LiteLLMRateLimitRetryHandler(cfg)],
+            components=[handler],
             order=[HarnessEventHandler],
         )
     )

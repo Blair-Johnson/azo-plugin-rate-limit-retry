@@ -421,5 +421,7 @@ def test_register_features_adds_named_feature():
     builder = Builder()
     register_features(builder, session=SimpleNamespace(), config={})
 
-    assert [feature.name for feature in builder.features] == ["litellm_rate_limit_retry"]
-    assert isinstance(builder.features[0].components[0], LiteLLMRateLimitRetryHandler)
+    assert [feature.name for feature in builder.features] == [
+        "litellm_rate_limit_retry_settings", "litellm_rate_limit_retry"
+    ]
+    assert isinstance(builder.features[1].components[0], LiteLLMRateLimitRetryHandler)

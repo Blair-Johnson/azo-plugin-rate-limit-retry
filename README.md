@@ -118,3 +118,18 @@ Note: the current development installer prepares a managed source checkout befor
 - It only overrides retry behavior when a rate-limit signal and a bounded retry/reset deadline are both found.
 - It avoids durable notice spam; the countdown is status-line progress text.
 - Header/body formats vary by provider and proxy version. Unknown formats intentionally fall back to Agent Zoo's default error policy.
+
+## `/config` settings
+
+The plugin exposes read-only effective maximum delay and countdown interval
+(integer milliseconds), maximum captured errors (integer), and one-shot notice
+(boolean). Edit `litellm_rate_limit_retry` in the main harness config and reload
+to change them. Durations that are not exact integer milliseconds display a safe
+error rather than being rounded. Capture count reflects the handler's existing
+normalization, not a new conversion.
+
+The installed JSON is a configuration example: the current plugin does not read
+it at runtime. No writable rows are offered because the plugin has no authoritative
+plugin-owned persistence path; `/config` must not silently edit main harness
+configuration or create a second configuration source. No defaults or behavior
+change until the existing harness configuration is edited and reloaded.
