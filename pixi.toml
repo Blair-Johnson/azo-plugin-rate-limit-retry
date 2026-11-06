@@ -15,7 +15,7 @@ ripgrep = ">=15.1.0,<16"
 pytest = ">=8"
 
 [feature.test.tasks]
-test = "PYTHONPATH=/home/bjohnson/Documents/GitHub/agent-utils-worktrees/harness-event-api/src:src python -m pytest"
+test = "python -m pytest"
 
 [environments]
 test = ["test"]
@@ -23,8 +23,6 @@ test = ["test"]
 [tool.agent-zoo.plugin]
 name = "azo-plugin-rate-limit-retry"
 common = ["src/litellm_rate_limit_retry_plugin.py"]
-orchestrator = []
-executor = []
 
 [tool.agent-zoo.plugin.config]
 files = ["config/litellm_rate_limit_retry.json"]

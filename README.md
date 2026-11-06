@@ -93,8 +93,10 @@ pixi run -e test test
 Static source-file plugin inspection from the Agent Zoo development checkout:
 
 ```bash
-PYTHONPATH=/home/bjohnson/Documents/GitHub/agent-utils-worktrees/harness-event-api/src \
-python /home/bjohnson/Documents/GitHub/agent-zoo-worktrees/harness-event-api-design/skills/agent-zoo-userspace-plugins/scripts/static_inspect_plugin.py \
+AGENT_ZOO_REPO=/path/to/agent-zoo
+AGENT_UTILS_SRC=/path/to/agent-utils/src
+PYTHONPATH="$AGENT_UTILS_SRC" \
+python "$AGENT_ZOO_REPO/skills/agent-zoo-userspace-plugins/scripts/static_inspect_plugin.py" \
   src/litellm_rate_limit_retry_plugin.py
 ```
 
@@ -102,11 +104,13 @@ Dry-run install validation without touching your live Agent Zoo plugin state:
 
 ```bash
 REPO=$(pwd)
+AGENT_ZOO_REPO=/path/to/agent-zoo
+AGENT_UTILS_SRC=/path/to/agent-utils/src
 TMP_STATE=$(mktemp -d)
-cd /home/bjohnson/Documents/GitHub/agent-zoo-worktrees/harness-event-api-design
-AGENT_ZOO_STATE_ROOT="$TMP_STATE" \
-PYTHONPATH=/home/bjohnson/Documents/GitHub/agent-utils-worktrees/harness-event-api/src:. \
-pixi run python -m agents.orchestrated.plugin_install install "$REPO" --dry-run
+cd "$AGENT_ZOO_REPO"
+AGENT_ZOO_HOME="$TMP_STATE" \
+PYTHONPATH="$AGENT_UTILS_SRC:." \
+pixi run python -m agent_zoo.plugin_install install "$REPO" --dry-run
 rm -rf "$TMP_STATE"
 ```
 
