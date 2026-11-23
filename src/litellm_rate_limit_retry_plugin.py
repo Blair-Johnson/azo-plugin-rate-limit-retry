@@ -359,7 +359,6 @@ class LiteLLMRateLimitRetryHandler:
 
         if (
             getattr(state, "interrupted", False)
-            or getattr(state, "_interrupted", False)
             or getattr(state, "shutdown", False)
             or getattr(state, "done", False)
             or getattr(state, "active_llm", None) is not None
