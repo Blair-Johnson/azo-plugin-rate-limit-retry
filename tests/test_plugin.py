@@ -7,7 +7,19 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_utils.harness_events import HarnessControl, HarnessEvent
+from agent_utils.core.events import InterruptRequested, RenderRequested, TimerFired
+from agent_utils.core.io import CancelOp, StartTimer, SubmitOp
+from agent_utils.core.session import Session
+from agent_utils.core.state import State
+from agent_zoo.events import (
+    BeforeLLM,
+    EmitNotice,
+    LLMFailed,
+    ProjectionRequested,
+    RetryRequested,
+    SetStatus,
+)
+from agent_zoo.pipelines.default import build_default_builder
 
 from litellm_rate_limit_retry_plugin import (
     LiteLLMRateLimitRetryHandler,
@@ -68,7 +80,6 @@ def test_x_ratelimit_reset_header_formats(value, expected_delay):
     assert parsed.source == "header:x-ratelimit-reset-requests"
 
 
-
 def test_standard_ratelimit_reset_header_is_signal_and_deadline():
     parsed = parse_rate_limit_deadline(
         payload(message="LiteLLM provider response", headers={"RateLimit-Reset": "30"})
@@ -102,6 +113,8 @@ def test_retry_after_http_date_with_month_name_is_not_parsed_as_duration_prefix(
     assert parsed is not None
     assert parsed.deadline == pytest.approx(RUNTIME_NOW + 90)
     assert parsed.source == "header:Retry-After"
+
+
 def test_bare_retry_after_header_is_ignored_for_generic_503_maintenance():
     parsed = parse_rate_limit_deadline(
         payload(
@@ -189,6 +202,7 @@ def test_top_level_payload_error_code_429_and_limit_resets_at_utc_message():
     assert parsed.deadline == pytest.approx(RUNTIME_NOW + 75)
     assert parsed.source == "text"
     assert parsed.signal == "status:429"
+
 
 def test_recursively_finds_rate_limit_reset_in_unknown_envelope_shape():
     wall_deadline = WALL_TIME + 90
@@ -286,7 +300,6 @@ def test_text_duration_does_not_parse_unit_prefix_inside_word():
     assert parsed is None
 
 
-
 def test_text_duration_does_not_parse_partial_number_before_punctuation():
     assert parse_rate_limit_deadline(payload(message="LiteLLM RateLimitError: try again in 1,000 seconds")) is None
     assert parse_rate_limit_deadline(payload(message="LiteLLM RateLimitError: retry after: 2,500 ms")) is None
@@ -321,77 +334,123 @@ def test_exception_response_headers_are_parsed_without_persisting_exception():
     assert parsed.deadline == pytest.approx(RUNTIME_NOW + 8)
 
 
-def test_handler_runtime_error_returns_retry_decision_and_serializable_state():
-    handler = LiteLLMRateLimitRetryHandler()
-    state = SimpleNamespace()
-    event = HarnessEvent("evt-1", "runtime.error", 1, payload(status_code=429, headers={"Retry-After": "5"}))
+def test_handler_llm_failed_stops_event_schedules_timer_and_stores_serializable_state():
+    handler = LiteLLMRateLimitRetryHandler({"emit_one_shot_notice": True})
+    state = State()
+    emitted = []
+    event = LLMFailed(
+        error="LiteLLM proxy error: rate limit exceeded",
+        attempt=1,
+        provider_payload={"status_code": 429, "headers": {"Retry-After": "5"}},
+        request_id="evt-1",
+        ts=RUNTIME_NOW,
+    )
 
-    decision = handler.handle_harness_event(event, state)
+    handler.handle(event, state, emitted.append)
 
-    assert decision is not None
-    assert decision.control is HarnessControl.RETRY
-    assert decision.wake.at == pytest.approx(RUNTIME_NOW + 5)
-    assert decision.wake.tick_seconds == 1.0
-    assert decision.effects[0].kind == "status"
-    assert "retrying in 5s" in decision.effects[0].payload["text"]
+    assert event.stopped is True
+    effects = state.io.take_outbox()
+    assert len(effects) == 1
+    assert isinstance(effects[0], SubmitOp)
+    assert isinstance(effects[0].request, StartTimer)
+    assert effects[0].request.delay_s == pytest.approx(1.0)
+    statuses = [ev for ev in emitted if isinstance(ev, SetStatus)]
+    assert statuses and "retrying in 5s" in statuses[0].label
+    notices = [ev for ev in emitted if isinstance(ev, EmitNotice)]
+    assert notices and "retrying in 5s" in notices[0].text
     stored = getattr(state, STATE_ATTR)["captures"]["evt-1"]
     assert stored["deadline"] == pytest.approx(RUNTIME_NOW + 5)
     assert "exception" not in stored
 
 
-def test_handler_returns_none_for_unconfident_runtime_error():
+def test_handler_ignores_unconfident_llm_failed():
     handler = LiteLLMRateLimitRetryHandler()
-    state = SimpleNamespace()
-    event = HarnessEvent("evt-1", "runtime.error", 1, payload(message="network reset", headers={}))
+    state = State()
+    emitted = []
+    event = LLMFailed(error="network reset", attempt=1, request_id="evt-1", ts=RUNTIME_NOW)
 
-    assert handler.handle_harness_event(event, state) is None
+    handler.handle(event, state, emitted.append)
+
+    assert event.stopped is False
+    assert emitted == []
+    assert state.io.take_outbox() == []
 
 
-def test_wait_tick_updates_status_for_captured_source_event():
-    handler = LiteLLMRateLimitRetryHandler()
-    state = SimpleNamespace()
-    error_event = HarnessEvent("evt-1", "runtime.error", 1, payload(status_code=429, headers={"Retry-After": "5"}))
-    assert handler.handle_harness_event(error_event, state) is not None
-
-    tick = HarnessEvent(
-        "evt-2",
-        "runtime.wait.tick",
-        2,
-        {
-            "wait_id": "evt-1:wait",
-            "source_event_id": "evt-1",
-            "source_event_kind": "runtime.error",
-            "source_control": "retry",
-            "reason": "LiteLLM/provider rate limit retry deadline",
-            "now": RUNTIME_NOW + 2,
-            "deadline": RUNTIME_NOW + 5,
-            "remaining_seconds": 3.1,
-            "total_seconds": 5,
-            "elapsed_seconds": 1.9,
-            "tick_index": 2,
-            "done": False,
-            "end_reason": "",
-        },
+def test_timer_tick_updates_status_and_triggers_retry_on_deadline():
+    handler = LiteLLMRateLimitRetryHandler({"tick_seconds": 1.0})
+    state = State()
+    emitted = []
+    error_event = LLMFailed(
+        error="LiteLLM RateLimitError",
+        attempt=1,
+        provider_payload={"status_code": 429, "headers": {"Retry-After": "2.5"}},
+        request_id="evt-1",
+        ts=RUNTIME_NOW,
     )
+    handler.handle(error_event, state, emitted.append)
+    first_op = state.io.take_outbox()[0].op_id
 
-    decision = handler.handle_harness_event(tick, state)
-
-    assert decision is not None
-    assert decision.control is HarnessControl.CONTINUE
-    assert decision.effects == [decision.effects[0]]
-    assert decision.effects[0].kind == "status"
-    assert decision.effects[0].payload == {"active": True, "text": "LiteLLM rate limited; retrying in 4s"}
+    # Intermediate tick at +1.0s (1.5s remaining -> "retrying in 2s")
+    emitted.clear()
+    tick1 = TimerFired(op_id=first_op, ts=RUNTIME_NOW + 1.0)
+    handler.handle(tick1, state, emitted.append)
+    assert tick1.stopped is True
+    statuses = [ev for ev in emitted if isinstance(ev, SetStatus)]
+    assert statuses[0].label == "LiteLLM rate limited; retrying in 2s"
+    assert not any(isinstance(ev, BeforeLLM) for ev in emitted)
     stored = getattr(state, STATE_ATTR)["captures"]["evt-1"]
-    assert stored["wait_ids"] == ["evt-1:wait"]
-    assert stored["last_tick"]["remaining_seconds"] == pytest.approx(3.1)
+    assert stored["last_tick"]["remaining_seconds"] == pytest.approx(1.5)
+    assert stored["last_tick"]["done"] is False
+    second_op = state.io.take_outbox()[0].op_id
+
+    # Final tick at +2.5s (0s remaining -> emits RenderRequested + BeforeLLM)
+    emitted.clear()
+    tick2 = TimerFired(op_id=second_op, ts=RUNTIME_NOW + 2.5)
+    handler.handle(tick2, state, emitted.append)
+    assert tick2.stopped is True
+    statuses = [ev for ev in emitted if isinstance(ev, SetStatus)]
+    assert statuses[0].label == "LiteLLM rate limit wait complete; retrying now"
+    assert any(isinstance(ev, RenderRequested) for ev in emitted)
+    assert any(isinstance(ev, BeforeLLM) for ev in emitted)
+    assert stored["last_tick"]["done"] is True
+    assert state.io.take_outbox() == []
 
 
-def test_wait_tick_for_unknown_source_event_is_ignored():
+def test_timer_fired_for_unknown_op_is_ignored():
     handler = LiteLLMRateLimitRetryHandler()
-    state = SimpleNamespace(**{STATE_ATTR: {"version": 1, "captures": {}}})
-    tick = HarnessEvent("evt-2", "runtime.wait.tick", 2, {"source_event_id": "missing", "remaining_seconds": 3})
+    state = State()
+    emitted = []
+    tick = TimerFired(op_id="op_unknown", ts=RUNTIME_NOW + 1.0)
 
-    assert handler.handle_harness_event(tick, state) is None
+    handler.handle(tick, state, emitted.append)
+
+    assert tick.stopped is False
+    assert emitted == []
+
+
+def test_interrupt_and_retry_cancel_active_wait():
+    handler = LiteLLMRateLimitRetryHandler()
+    state = State()
+    event = LLMFailed(
+        error="LiteLLM RateLimitError",
+        attempt=1,
+        provider_payload={"status_code": 429, "headers": {"Retry-After": "10"}},
+        request_id="evt-1",
+        ts=RUNTIME_NOW,
+    )
+    handler.handle(event, state, lambda _ev: None)
+    op_id = state.io.take_outbox()[0].op_id
+
+    interrupt = InterruptRequested(reason="user")
+    handler.handle(interrupt, state, lambda _ev: None)
+    assert interrupt.stopped is False
+    effects = state.io.take_outbox()
+    assert any(isinstance(eff, CancelOp) and eff.op_id == op_id for eff in effects)
+
+    # Firing the cancelled op is a no-op
+    emitted = []
+    handler.handle(TimerFired(op_id=op_id, ts=RUNTIME_NOW + 10), state, emitted.append)
+    assert emitted == []
 
 
 def test_plugin_imports_with_agent_zoo_file_loader_style():
@@ -410,18 +469,15 @@ def test_plugin_imports_with_agent_zoo_file_loader_style():
     assert module.PLUGIN_NAME == "litellm_rate_limit_retry"
 
 
-def test_register_features_adds_named_feature():
-    class Builder:
-        def __init__(self):
-            self.features = []
+def test_register_features_adds_named_feature_and_composes_with_default_builder():
+    session = Session()
+    builder = build_default_builder(
+        session, config={}, include_plugins=False, include_llm_drivers=False
+    )
+    register_features(builder, session=session, config={})
+    pipeline = builder.build()
 
-        def add(self, feature):
-            self.features.append(feature)
-
-    builder = Builder()
-    register_features(builder, session=SimpleNamespace(), config={})
-
-    assert [feature.name for feature in builder.features] == [
-        "litellm_rate_limit_retry_settings", "litellm_rate_limit_retry"
-    ]
-    assert isinstance(builder.features[1].components[0], LiteLLMRateLimitRetryHandler)
+    assert builder.has("litellm_rate_limit_retry_settings")
+    assert builder.has("litellm_rate_limit_retry")
+    names = [type(c).__name__ for c in pipeline.components]
+    assert names.index("LiteLLMRateLimitRetryHandler") < names.index("DefaultRetryPolicy")

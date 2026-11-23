@@ -2,9 +2,9 @@
 
 This module is intentionally self-contained so it can be installed as an
 Agent Zoo source-file plugin via ``azo-plugin install <repo-or-git-url>``.
-It observes generic harness runtime events and only overrides default retry
-behavior when it can confidently identify a rate-limit error and parse a retry
-or reset deadline.
+It intercepts ``LLMFailed`` ahead of ``DefaultRetryPolicy`` and only overrides
+default retry behavior when it can confidently identify a rate-limit error and
+parse a retry or reset deadline.
 """
 
 import datetime as _dt
@@ -12,19 +12,36 @@ import email.utils
 import json
 import math
 import os
-import tempfile
 import re
+import tempfile
 import time
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable
 
-from agent_utils import Feature
-from agent_zoo.runtime.settings import Setting, SettingError
-from agent_zoo.projects import resolve_state_root
-from agent_utils.components import HarnessEventHandler
-from agent_utils.harness_events import HarnessControl, HarnessDecision, HarnessEffect, WakeSpec
+from agent_utils.core.events import (
+    Event,
+    InterruptRequested,
+    RenderRequested,
+    TimerFired,
+)
+from agent_utils.core.io import StartTimer
+from agent_utils.core.pipeline import EmitFn, Feature
+from agent_utils.core.state import State
+from agent_zoo.events import (
+    BeforeLLM,
+    EmitNotice,
+    LLMFailed,
+    ProjectionRequested,
+    RetryRequested,
+    SetStatus,
+    ShutdownRequested,
+)
+from agent_zoo.features.settings import Setting, SettingError
+from agent_zoo.features.turn.llm_caller import LLMCaller
+from agent_zoo.features.turn.retry_policy import DefaultRetryPolicy
+from agent_zoo.storage.projects import resolve_state_root
 
 PLUGIN_NAME = "litellm_rate_limit_retry"
 STATE_ATTR = "litellm_rate_limit_retry_state"
@@ -211,16 +228,28 @@ def register_features(builder, *, session, config):
             **({"min": 1, "max": 2**63 - 1} if kind == "int" else {}),
         ))
     builder.add(Feature(name="litellm_rate_limit_retry_settings", components=settings, order=[Setting]))
-    builder.add(Feature(name=PLUGIN_NAME, components=[handler], order=[HarnessEventHandler]))
+    builder.add(
+        Feature(
+            name=PLUGIN_NAME,
+            components=[handler],
+            order=[LLMCaller, LiteLLMRateLimitRetryHandler, DefaultRetryPolicy],
+        )
+    )
 
 
-class LiteLLMRateLimitRetryHandler(HarnessEventHandler):
+class LiteLLMRateLimitRetryHandler:
     """Capture LiteLLM/provider rate-limit errors and drive retry countdown UX."""
 
-    event_kinds = {"runtime.error", "runtime.wait.tick"}
+    handles = (
+        LLMFailed,
+        TimerFired,
+        RetryRequested,
+        InterruptRequested,
+        ShutdownRequested,
+    )
     init = {STATE_ATTR: dict}
     optional_reads = {STATE_ATTR}
-    writes = {STATE_ATTR}
+    writes = {STATE_ATTR, "retry_timer_op", "dirty"}
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         cfg = dict(config or {})
@@ -228,111 +257,158 @@ class LiteLLMRateLimitRetryHandler(HarnessEventHandler):
         self.tick_seconds = _positive_float(cfg.get("tick_seconds"), DEFAULT_TICK_SECONDS)
         self.max_captures = max(1, int(_positive_float(cfg.get("max_captures"), DEFAULT_MAX_CAPTURES)))
         self.emit_one_shot_notice = bool(cfg.get("emit_one_shot_notice", DEFAULT_EMIT_ONE_SHOT_NOTICE))
+        self._active_waits: dict[str, dict[str, Any]] = {}
+        self._event_seq = 0
 
-    def handle_harness_event(self, event, state):
-        if getattr(event, "kind", "") == "runtime.error":
-            return self._handle_runtime_error(event, state)
-        if getattr(event, "kind", "") == "runtime.wait.tick":
-            return self._handle_wait_tick(event, state)
-        return None
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        if isinstance(event, LLMFailed):
+            self._handle_llm_failed(event, state, emit)
+        elif isinstance(event, TimerFired):
+            self._handle_timer_fired(event, state, emit)
+        elif isinstance(event, (RetryRequested, InterruptRequested, ShutdownRequested)):
+            self._cancel_all_waits(state)
 
-    def _handle_runtime_error(self, event, state):
-        payload = getattr(event, "payload", None)
-        if not isinstance(payload, dict):
-            return None
+    def _cancel_all_waits(self, state: State) -> None:
+        for op_id in list(self._active_waits):
+            self._active_waits.pop(op_id, None)
+            state.io.cancel(op_id)
+            if getattr(state, "retry_timer_op", None) == op_id:
+                state.retry_timer_op = None
+
+    def _handle_llm_failed(self, event: LLMFailed, state: State, emit: EmitFn) -> None:
+        if event.context_limit:
+            return
+
+        runtime_now = event.ts if event.ts else time.monotonic()
+        wall_time = time.time()
+        payload: dict[str, Any] = {
+            "phase": "llm.provider",
+            "runtime_now": runtime_now,
+            "wall_time": wall_time,
+            "attempt": event.attempt,
+            "message": str(event.error or ""),
+            "provider_payload": event.provider_payload,
+            "traceback_text": event.traceback_text,
+        }
+        if isinstance(event.error, BaseException):
+            payload["exception"] = event.error
+            payload["exception_type"] = (
+                f"{type(event.error).__module__}.{type(event.error).__qualname__}"
+            )
 
         parsed = parse_rate_limit_deadline(payload, max_delay_seconds=self.max_delay_seconds)
         if parsed is None:
-            return None
+            return
 
-        source_event_id = str(getattr(event, "id", "") or "")
+        event.stop()
+        self._cancel_all_waits(state)
+        existing_retry_op = getattr(state, "retry_timer_op", None)
+        if existing_retry_op is not None:
+            state.retry_timer_op = None
+            state.io.cancel(existing_retry_op)
+
+        self._event_seq += 1
+        source_event_id = str(event.request_id or f"llm_failed_{self._event_seq}")
+        wait_id = f"{source_event_id}:wait"
+
         store = _state_store(state)
         captures = store.setdefault("captures", {})
-        now = _runtime_now(payload)
-        attempt = _safe_int(payload.get("attempt"))
         captures[source_event_id] = {
             "source_event_id": source_event_id,
             "deadline": parsed.deadline,
             "delay_seconds": parsed.delay_seconds,
-            "captured_runtime": now,
-            "attempt": attempt,
+            "captured_runtime": runtime_now,
+            "attempt": _safe_int(event.attempt),
             "source": parsed.source,
             "signal": parsed.signal,
-            "wait_ids": [],
+            "wait_ids": [wait_id],
         }
         _prune_captures(captures, self.max_captures)
 
-        text = _status_text(parsed.delay_seconds)
-        effects = [HarnessEffect("status", {"active": True, "text": text})]
+        step_delay = min(self.tick_seconds, max(0.0, parsed.delay_seconds))
+        op_id = state.io.submit(StartTimer(delay_s=float(step_delay)), tag="retry")
+        state.retry_timer_op = op_id
+        self._active_waits[op_id] = {
+            "source_event_id": source_event_id,
+            "wait_id": wait_id,
+            "deadline": parsed.deadline,
+            "last_ts": runtime_now,
+            "step_delay": step_delay,
+            "tick_index": 0,
+        }
+        state.dirty = True
+
+        emit(SetStatus(active=True, label=_status_text(parsed.delay_seconds)))
         if self.emit_one_shot_notice:
-            effects.append(
-                HarnessEffect(
-                    "notice",
-                    {
-                        "level": "warning",
-                        "text": f"LiteLLM/provider rate limit detected; retrying in {math.ceil(parsed.delay_seconds)}s.",
-                    },
+            emit(
+                EmitNotice(
+                    f"LiteLLM/provider rate limit detected; retrying in {math.ceil(parsed.delay_seconds)}s.",
+                    level="warning",
                 )
             )
+        emit(ProjectionRequested())
 
-        return HarnessDecision(
-            control=HarnessControl.RETRY,
-            wake=WakeSpec(at=parsed.deadline, tick_seconds=self.tick_seconds, reason="rate limit retry deadline"),
-            effects=effects,
-            reason="LiteLLM/provider rate limit retry deadline",
-            payload={
-                "plugin": PLUGIN_NAME,
-                "source_event_id": source_event_id,
-                "deadline": parsed.deadline,
-                "delay_seconds": parsed.delay_seconds,
-                "source": parsed.source,
-                "signal": parsed.signal,
-            },
-        )
+    def _handle_timer_fired(self, event: TimerFired, state: State, emit: EmitFn) -> None:
+        wait = self._active_waits.pop(event.op_id, None)
+        if wait is None:
+            return
 
-    def _handle_wait_tick(self, event, state):
-        payload = getattr(event, "payload", None)
-        if not isinstance(payload, dict):
-            return None
-        source_event_id = str(payload.get("source_event_id") or "")
-        if not source_event_id:
-            return None
+        if getattr(state, "retry_timer_op", None) == event.op_id:
+            state.retry_timer_op = None
+        event.stop()
+
+        if (
+            getattr(state, "interrupted", False)
+            or getattr(state, "_interrupted", False)
+            or getattr(state, "shutdown", False)
+            or getattr(state, "done", False)
+            or getattr(state, "active_llm", None) is not None
+        ):
+            return
+
+        now = event.ts if event.ts else (wait["last_ts"] + wait["step_delay"])
+        remaining = max(0.0, float(wait["deadline"]) - now)
+        done = remaining <= 1e-6
+        if done:
+            remaining = 0.0
+        tick_index = int(wait["tick_index"]) + 1
+        source_event_id = wait["source_event_id"]
+        wait_id = wait["wait_id"]
 
         store = _state_store(state)
         capture = (store.get("captures") or {}).get(source_event_id)
-        if not isinstance(capture, dict):
-            return None
-
-        wait_id = str(payload.get("wait_id") or "")
-        if wait_id:
+        if isinstance(capture, dict):
             wait_ids = capture.setdefault("wait_ids", [])
             if isinstance(wait_ids, list) and wait_id not in wait_ids:
                 wait_ids.append(wait_id)
+            capture["last_tick"] = {
+                "wait_id": wait_id,
+                "remaining_seconds": remaining,
+                "tick_index": tick_index,
+                "done": done,
+            }
 
-        remaining = _float_or_none(payload.get("remaining_seconds"))
-        if remaining is None:
-            deadline = _float_or_none(payload.get("deadline")) or _float_or_none(capture.get("deadline"))
-            now = _float_or_none(payload.get("now"))
-            remaining = max(0.0, deadline - now) if deadline is not None and now is not None else 0.0
-        remaining = max(0.0, remaining)
+        state.dirty = True
+        if done:
+            emit(SetStatus(active=True, label="LiteLLM rate limit wait complete; retrying now"))
+            emit(ProjectionRequested())
+            emit(RenderRequested())
+            emit(BeforeLLM())
+            return
 
-        if bool(payload.get("done")):
-            text = "LiteLLM rate limit wait complete; retrying now"
-        else:
-            text = _status_text(remaining)
-
-        capture["last_tick"] = {
+        next_step = min(self.tick_seconds, remaining)
+        next_op = state.io.submit(StartTimer(delay_s=float(next_step)), tag="retry")
+        state.retry_timer_op = next_op
+        self._active_waits[next_op] = {
+            "source_event_id": source_event_id,
             "wait_id": wait_id,
-            "remaining_seconds": remaining,
-            "tick_index": _safe_int(payload.get("tick_index")),
-            "done": bool(payload.get("done")),
+            "deadline": wait["deadline"],
+            "last_ts": now,
+            "step_delay": next_step,
+            "tick_index": tick_index,
         }
-
-        return HarnessDecision(
-            effects=[HarnessEffect("status", {"active": True, "text": text})],
-            reason="LiteLLM/provider rate limit countdown status",
-            payload={"plugin": PLUGIN_NAME, "source_event_id": source_event_id, "wait_id": wait_id},
-        )
+        emit(SetStatus(active=True, label=_status_text(remaining)))
+        emit(ProjectionRequested())
 
 
 def parse_rate_limit_deadline(payload: dict[str, Any], *, max_delay_seconds: float = DEFAULT_MAX_DELAY_SECONDS) -> DeadlineParse | None:

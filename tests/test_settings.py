@@ -1,19 +1,19 @@
 """Saved defaults, through the actual pipeline and registry."""
 import json
 
-from agent_utils import PipelineBuilder, Session
-from agent_utils.builder import flatten
-from agent_zoo.runtime.settings import Setting, SettingsContext, SettingsRegistry
+from agent_utils.core.pipeline import PipelineBuilder
+from agent_utils.core.session import Session
+from agent_zoo.features.settings import Setting, SettingsContext, SettingsRegistry
 from litellm_rate_limit_retry_plugin import register_features, _defaults_path
 
 
 def catalog(config):
     session = Session()
-    builder = PipelineBuilder(session)
+    builder = PipelineBuilder()
     register_features(builder, session=session, config=config)
-    session.pipeline = builder.build()
-    registry = SettingsRegistry([c for c in flatten(session.pipeline) if isinstance(c, Setting)])
-    ctx = SettingsContext(session)
+    session.pipeline = builder.build(suppress_warnings=True)
+    registry = SettingsRegistry([c for c in session.pipeline.components if isinstance(c, Setting)])
+    ctx = SettingsContext(state=session.state, emit=lambda _ev: None)
     result = registry.handle({"type": "plugin_settings", "action": "list", "request_id": "test"}, ctx)
     assert result["ok"]
     return registry, ctx, result["settings"]
