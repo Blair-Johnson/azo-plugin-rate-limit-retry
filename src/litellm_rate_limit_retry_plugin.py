@@ -29,8 +29,8 @@ from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import State
 from agent_zoo.durability import (
     DurableSpec,
+    PluginConfigBox,
     PluginStorage,
-    StoreUpdate,
     acquire_turn_blocker,
     release_turn_blocker,
 )
@@ -72,12 +72,6 @@ class RateLimitRetryState:
 class _RetryRuntime:
     active_waits: dict[str, dict[str, Any]] = field(default_factory=dict)
     event_seq: int = 0
-
-
-@dataclass
-class _RetryConfigBox:
-    document: dict[str, Any] | None = None
-    load_error: bool = False
 
 _RETRY_AFTER_KEYS = {"retry-after", "retry_after", "retryafter"}
 _RESET_HEADER_PREFIXES = (
@@ -169,25 +163,24 @@ def _defaults_path() -> Path:
     return PluginStorage(REPO_PLUGIN_NAME, config_filename=CONFIG_RELATIVE).config.path
 
 
-def _load_config_box() -> _RetryConfigBox:
-    try:
-        path = _defaults_path().resolve()
-        try:
-            document = json.loads(path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            document = {}
-        if not isinstance(document, dict) or not isinstance(document.get(PLUGIN_NAME, {}), dict):
-            return _RetryConfigBox(document=None, load_error=True)
-        return _RetryConfigBox(document=document, load_error=False)
-    except Exception:
-        return _RetryConfigBox(document=None, load_error=True)
+def _validate_config_doc(document: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(document, dict) or not isinstance(document.get(PLUGIN_NAME, {}), dict):
+        raise ValueError("Cannot read retry defaults; repair the file before editing.")
+    return dict(document)
 
 
-def _read_setting_from_box(box: _RetryConfigBox, field_name: str, default: Any) -> Any:
-    if box.load_error or box.document is None:
-        raise SettingError("Cannot read retry defaults; repair the file before editing.")
+def _load_config_box() -> PluginConfigBox:
+    return PluginConfigBox(
+        REPO_PLUGIN_NAME,
+        config_filename=CONFIG_RELATIVE,
+        validate=_validate_config_doc,
+    )
+
+
+def _read_setting_from_box(box: PluginConfigBox, field_name: str, default: Any) -> Any:
+    document = box.require_loaded()
     duration = field_name in {"max_delay_seconds", "tick_seconds"}
-    raw = box.document.get(PLUGIN_NAME, {}).get(field_name, default)
+    raw = document.get(PLUGIN_NAME, {}).get(field_name, default)
     if type(default) is bool:
         if type(raw) is not bool:
             raise SettingError("Retry notice default must be a boolean.")
@@ -208,10 +201,8 @@ def _read_setting_from_box(box: _RetryConfigBox, field_name: str, default: Any) 
 
 
 def _write_setting_to_box(
-    ctx: Any, box: _RetryConfigBox, field_name: str, default: Any, value: Any
+    ctx: Any, box: PluginConfigBox, field_name: str, default: Any, value: Any
 ) -> None:
-    if box.load_error or box.document is None:
-        raise SettingError("Cannot read retry defaults; repair the file before editing.")
     duration = field_name in {"max_delay_seconds", "tick_seconds"}
     if type(default) is bool:
         if type(value) is not bool:
@@ -223,32 +214,20 @@ def _write_setting_to_box(
         stored = value / 1000 if duration else value
         if duration and Decimal(str(stored)) * 1000 != value:
             raise SettingError("Retry duration cannot be saved as exact milliseconds.")
-    previous = json.loads(json.dumps(box.document))
-    updated = json.loads(json.dumps(box.document))
-    updated.setdefault(PLUGIN_NAME, {})[field_name] = stored
-    box.document = updated
 
-    def _rollback() -> None:
-        box.document = previous
+    def _update(doc: dict[str, Any]) -> dict[str, Any]:
+        section = dict(doc.get(PLUGIN_NAME, {}))
+        section[field_name] = stored
+        doc[PLUGIN_NAME] = section
+        return doc
 
-    req = StoreUpdate(
-        plugin=REPO_PLUGIN_NAME,
-        scope="config",
-        config_filename=CONFIG_RELATIVE,
-        value=updated,
-    )
-    submit_persist = getattr(ctx, "submit_persist_io", None)
-    if callable(submit_persist) and getattr(ctx, "state", None) is not None:
-        submit_persist(req, rollback=_rollback)
-    else:
-        box.document = previous
-        raise SettingError("Cannot save retry defaults without session IO.")
+    box.mutate(ctx, _update)
 
 
 def register_features(builder, *, config):
     """Register saved defaults separately from runtime configuration overrides."""
     box = _load_config_box()
-    cfg = dict((box.document or {}).get(PLUGIN_NAME, {})) if not box.load_error else {}
+    cfg = dict(box.data.get(PLUGIN_NAME, {})) if box.load_error is None else {}
     cfg.update(_plugin_config(config))
     handler = LiteLLMRateLimitRetryHandler(cfg)
     settings = []
