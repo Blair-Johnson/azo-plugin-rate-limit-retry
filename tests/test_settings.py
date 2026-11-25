@@ -12,7 +12,7 @@ from litellm_rate_limit_retry_plugin import register_features, _defaults_path
 def catalog(config):
     session = Session()
     builder = PipelineBuilder()
-    register_features(builder, session=session, config=config)
+    register_features(builder, config=config)
     session.pipeline = builder.build(suppress_warnings=True)
     assert_pipeline_sans_io(session.pipeline)
     registry = SettingsRegistry([c for c in session.pipeline.components if isinstance(c, Setting)])

@@ -27,7 +27,13 @@ from agent_utils.core.events import (
 from agent_utils.core.io import StartTimer
 from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import State
-from agent_zoo.durability import DurableSpec, PluginStorage, StoreUpdate
+from agent_zoo.durability import (
+    DurableSpec,
+    PluginStorage,
+    StoreUpdate,
+    acquire_turn_blocker,
+    release_turn_blocker,
+)
 from agent_zoo.events import (
     ContinueRequested,
     EmitNotice,
@@ -41,7 +47,6 @@ from agent_zoo.events import (
     UserMessage,
 )
 from agent_zoo.features.settings import Setting, SettingError
-from agent_zoo.features.turn._helpers import acquire_turn_blocker, release_turn_blocker
 from agent_zoo.features.turn.llm_caller import LLMCaller
 from agent_zoo.features.turn.retry_policy import DefaultRetryPolicy
 
@@ -240,9 +245,8 @@ def _write_setting_to_box(
         raise SettingError("Cannot save retry defaults without session IO.")
 
 
-def register_features(builder, *, session, config):
+def register_features(builder, *, config):
     """Register saved defaults separately from runtime configuration overrides."""
-    del session
     box = _load_config_box()
     cfg = dict((box.document or {}).get(PLUGIN_NAME, {})) if not box.load_error else {}
     cfg.update(_plugin_config(config))

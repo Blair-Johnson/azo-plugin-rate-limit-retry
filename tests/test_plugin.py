@@ -480,7 +480,7 @@ def test_register_features_adds_named_feature_and_composes_with_default_builder(
     builder = build_default_builder(
         session, config={}, include_plugins=False, include_llm_drivers=False
     )
-    register_features(builder, session=session, config={})
+    register_features(builder, config={})
     pipeline = builder.build()
 
     assert builder.has("litellm_rate_limit_retry_settings")
