@@ -40,7 +40,7 @@ def test_defaults_writable_and_no_host_config_mutation(tmp_path, monkeypatch):
     store_driver = PluginStoreDriver(state_root=tmp_path)
     store_reqs = [eff.request for eff in ctx.state.io.take_outbox() if isinstance(eff.request, StoreUpdate)]
     assert len(store_reqs) == 1
-    store_driver._execute(store_reqs[0])
+    store_driver.execute(store_reqs[0])
     assert json.loads(_defaults_path().read_text())["litellm_rate_limit_retry"]["tick_seconds"] == 1.5
     assert config == {"unrelated": {"prompt": "untouched"}}
 
