@@ -11,11 +11,9 @@ import datetime as _dt
 import email.utils
 import json
 import math
-import os
 import re
-import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Iterable
@@ -23,32 +21,58 @@ from typing import Any, Iterable
 from agent_utils.core.events import (
     Event,
     InterruptRequested,
-    RenderRequested,
+    SessionRestored,
     TimerFired,
 )
 from agent_utils.core.io import StartTimer
 from agent_utils.core.pipeline import EmitFn, Feature
 from agent_utils.core.state import State
+from agent_zoo.durability import DurableSpec, PluginStorage, StoreUpdate
 from agent_zoo.events import (
-    BeforeLLM,
+    ContinueRequested,
     EmitNotice,
+    HistoryEdited,
     LLMFailed,
+    PacingCheck,
     ProjectionRequested,
     RetryRequested,
     SetStatus,
     ShutdownRequested,
+    UserMessage,
 )
 from agent_zoo.features.settings import Setting, SettingError
+from agent_zoo.features.turn._helpers import acquire_turn_blocker, release_turn_blocker
 from agent_zoo.features.turn.llm_caller import LLMCaller
 from agent_zoo.features.turn.retry_policy import DefaultRetryPolicy
-from agent_zoo.storage.projects import resolve_state_root
 
 PLUGIN_NAME = "litellm_rate_limit_retry"
+REPO_PLUGIN_NAME = "azo-plugin-rate-limit-retry"
+CONFIG_RELATIVE = "config/litellm_rate_limit_retry.json"
 STATE_ATTR = "litellm_rate_limit_retry_state"
 DEFAULT_MAX_DELAY_SECONDS = 20 * 60
 DEFAULT_TICK_SECONDS = 1.0
 DEFAULT_MAX_CAPTURES = 64
 DEFAULT_EMIT_ONE_SHOT_NOTICE = False
+
+
+@dataclass
+class RateLimitRetryState:
+    """Durable per-session record of captured provider rate-limit events."""
+
+    version: int = 1
+    captures: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class _RetryRuntime:
+    active_waits: dict[str, dict[str, Any]] = field(default_factory=dict)
+    event_seq: int = 0
+
+
+@dataclass
+class _RetryConfigBox:
+    document: dict[str, Any] | None = None
+    load_error: bool = False
 
 _RETRY_AFTER_KEYS = {"retry-after", "retry_after", "retryafter"}
 _RESET_HEADER_PREFIXES = (
@@ -137,11 +161,10 @@ class DeadlineParse:
 
 
 def _defaults_path() -> Path:
-    return (resolve_state_root() / "plugin-configs" / "azo-plugin-rate-limit-retry"
-            / "config" / "litellm_rate_limit_retry.json")
+    return PluginStorage(REPO_PLUGIN_NAME, config_filename=CONFIG_RELATIVE).config.path
 
 
-def _saved_document():
+def _load_config_box() -> _RetryConfigBox:
     try:
         path = _defaults_path().resolve()
         try:
@@ -149,90 +172,116 @@ def _saved_document():
         except FileNotFoundError:
             document = {}
         if not isinstance(document, dict) or not isinstance(document.get(PLUGIN_NAME, {}), dict):
-            raise ValueError
-        return path, document
+            return _RetryConfigBox(document=None, load_error=True)
+        return _RetryConfigBox(document=document, load_error=False)
     except Exception:
-        raise SettingError("Cannot read retry defaults; repair the file before editing.") from None
+        return _RetryConfigBox(document=None, load_error=True)
 
 
-def _saved_setting(field, default, value=None):
-    path, document = _saved_document()
-    duration = field in {"max_delay_seconds", "tick_seconds"}
-    if value is None:
-        raw = document.get(PLUGIN_NAME, {}).get(field, default)
-        if type(default) is bool:
-            if type(raw) is not bool:
-                raise SettingError("Retry notice default must be a boolean.")
-            return raw
-        try:
-            number = Decimal(str(raw)) * (1000 if duration else 1)
-            if (not number.is_finite() or number != number.to_integral_value()
-                    or not 1 <= number <= 2**63 - 1):
-                raise ValueError
-            return int(number)
-        except (InvalidOperation, ValueError):
-            raise SettingError("Retry default must be a positive exact integer (milliseconds for durations).") from None
+def _read_setting_from_box(box: _RetryConfigBox, field_name: str, default: Any) -> Any:
+    if box.load_error or box.document is None:
+        raise SettingError("Cannot read retry defaults; repair the file before editing.")
+    duration = field_name in {"max_delay_seconds", "tick_seconds"}
+    raw = box.document.get(PLUGIN_NAME, {}).get(field_name, default)
+    if type(default) is bool:
+        if type(raw) is not bool:
+            raise SettingError("Retry notice default must be a boolean.")
+        return raw
+    try:
+        number = Decimal(str(raw)) * (1000 if duration else 1)
+        if (
+            not number.is_finite()
+            or number != number.to_integral_value()
+            or not 1 <= number <= 2**63 - 1
+        ):
+            raise ValueError
+        return int(number)
+    except (InvalidOperation, ValueError):
+        raise SettingError(
+            "Retry default must be a positive exact integer (milliseconds for durations)."
+        ) from None
+
+
+def _write_setting_to_box(
+    ctx: Any, box: _RetryConfigBox, field_name: str, default: Any, value: Any
+) -> None:
+    if box.load_error or box.document is None:
+        raise SettingError("Cannot read retry defaults; repair the file before editing.")
+    duration = field_name in {"max_delay_seconds", "tick_seconds"}
     if type(default) is bool:
         if type(value) is not bool:
             raise SettingError("Retry notice default must be a boolean.")
-        stored = value
+        stored: Any = value
     else:
         if type(value) is not int or not 1 <= value <= 2**63 - 1:
             raise SettingError("Retry default must be a positive bounded integer.")
         stored = value / 1000 if duration else value
         if duration and Decimal(str(stored)) * 1000 != value:
             raise SettingError("Retry duration cannot be saved as exact milliseconds.")
-    document.setdefault(PLUGIN_NAME, {})[field] = stored
-    temporary = None
-    try:
-        text = json.dumps(document, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        mode = path.stat().st_mode & 0o7777 if path.exists() else 0o600
-        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
-                                         prefix=".retry-settings-", delete=False) as stream:
-            temporary = Path(stream.name)
-            stream.write(text)
-        temporary.chmod(mode)
-        os.replace(temporary, path)
-    except Exception:
-        raise SettingError("Cannot save retry defaults.") from None
-    finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+    previous = json.loads(json.dumps(box.document))
+    updated = json.loads(json.dumps(box.document))
+    updated.setdefault(PLUGIN_NAME, {})[field_name] = stored
+    box.document = updated
+
+    def _rollback() -> None:
+        box.document = previous
+
+    req = StoreUpdate(
+        plugin=REPO_PLUGIN_NAME,
+        scope="config",
+        config_filename=CONFIG_RELATIVE,
+        value=updated,
+    )
+    submit_persist = getattr(ctx, "submit_persist_io", None)
+    if callable(submit_persist) and getattr(ctx, "state", None) is not None:
+        submit_persist(req, rollback=_rollback)
+    else:
+        box.document = previous
+        raise SettingError("Cannot save retry defaults without session IO.")
 
 
 def register_features(builder, *, session, config):
     """Register saved defaults separately from runtime configuration overrides."""
-    try:
-        _, document = _saved_document()
-        cfg = dict(document.get(PLUGIN_NAME, {}))
-    except SettingError:
-        # Keep retry available; /config reports the unreadable file without overwriting it.
-        cfg = {}
+    del session
+    box = _load_config_box()
+    cfg = dict((box.document or {}).get(PLUGIN_NAME, {})) if not box.load_error else {}
     cfg.update(_plugin_config(config))
     handler = LiteLLMRateLimitRetryHandler(cfg)
     settings = []
-    for key, field, label, default in (
+    for key, field_name, label, default in (
         ("max_delay_ms", "max_delay_seconds", "Maximum retry delay (ms)", DEFAULT_MAX_DELAY_SECONDS),
         ("tick_ms", "tick_seconds", "Countdown interval (ms)", DEFAULT_TICK_SECONDS),
         ("max_captures", "max_captures", "Maximum captured errors", DEFAULT_MAX_CAPTURES),
         ("emit_one_shot_notice", "emit_one_shot_notice", "Emit one-shot notice", DEFAULT_EMIT_ONE_SHOT_NOTICE),
     ):
         kind = "bool" if type(default) is bool else "int"
-        settings.append(Setting(
-            "rate_limit_retry." + key, label, kind,
-            get=lambda ctx, f=field, d=default: _saved_setting(f, d),
-            set=lambda ctx, value, f=field, d=default: _saved_setting(f, d, value),
-            group="Rate limit retry", apply="reload",
-            help="Saved plugin default; reload to apply. Explicit runtime configuration takes precedence.",
-            **({"min": 1, "max": 2**63 - 1} if kind == "int" else {}),
-        ))
+        settings.append(
+            Setting(
+                "rate_limit_retry." + key,
+                label,
+                kind,
+                get=lambda ctx, b=box, f=field_name, d=default: _read_setting_from_box(b, f, d),
+                set=lambda ctx, value, b=box, f=field_name, d=default: _write_setting_to_box(
+                    ctx, b, f, d, value
+                ),
+                group="Rate limit retry",
+                apply="reload",
+                help="Saved plugin default; reload to apply. Explicit runtime configuration takes precedence.",
+                **({"min": 1, "max": 2**63 - 1} if kind == "int" else {}),
+            )
+        )
     builder.add(Feature(name="litellm_rate_limit_retry_settings", components=settings, order=[Setting]))
     builder.add(
         Feature(
             name=PLUGIN_NAME,
             components=[handler],
             order=[LLMCaller, LiteLLMRateLimitRetryHandler, DefaultRetryPolicy],
+            durable_state=DurableSpec(
+                name=PLUGIN_NAME,
+                cls=RateLimitRetryState,
+                version=1,
+                on_fork="reset",
+            ),
         )
     )
 
@@ -246,10 +295,12 @@ class LiteLLMRateLimitRetryHandler:
         RetryRequested,
         InterruptRequested,
         ShutdownRequested,
+        UserMessage,
+        ContinueRequested,
+        HistoryEdited,
+        SessionRestored,
     )
-    init = {STATE_ATTR: dict}
-    optional_reads = {STATE_ATTR}
-    writes = {STATE_ATTR, "retry_timer_op", "dirty"}
+    writes = {"retry_timer_op", "dirty"}
 
     def __init__(self, config: dict[str, Any] | None = None) -> None:
         cfg = dict(config or {})
@@ -257,23 +308,40 @@ class LiteLLMRateLimitRetryHandler:
         self.tick_seconds = _positive_float(cfg.get("tick_seconds"), DEFAULT_TICK_SECONDS)
         self.max_captures = max(1, int(_positive_float(cfg.get("max_captures"), DEFAULT_MAX_CAPTURES)))
         self.emit_one_shot_notice = bool(cfg.get("emit_one_shot_notice", DEFAULT_EMIT_ONE_SHOT_NOTICE))
-        self._active_waits: dict[str, dict[str, Any]] = {}
-        self._event_seq = 0
+
+    @staticmethod
+    def _runtime(state: State) -> _RetryRuntime:
+        return state.runtime(PLUGIN_NAME, _RetryRuntime)
 
     def handle(self, event: Event, state: State, emit: EmitFn) -> None:
         if isinstance(event, LLMFailed):
             self._handle_llm_failed(event, state, emit)
         elif isinstance(event, TimerFired):
             self._handle_timer_fired(event, state, emit)
-        elif isinstance(event, (RetryRequested, InterruptRequested, ShutdownRequested)):
+        elif isinstance(
+            event,
+            (
+                RetryRequested,
+                InterruptRequested,
+                ShutdownRequested,
+                UserMessage,
+                ContinueRequested,
+                HistoryEdited,
+                SessionRestored,
+            ),
+        ):
             self._cancel_all_waits(state)
 
     def _cancel_all_waits(self, state: State) -> None:
-        for op_id in list(self._active_waits):
-            self._active_waits.pop(op_id, None)
+        rt = self._runtime(state)
+        had_waits = bool(rt.active_waits)
+        for op_id in list(rt.active_waits):
+            rt.active_waits.pop(op_id, None)
             state.io.cancel(op_id)
             if getattr(state, "retry_timer_op", None) == op_id:
                 state.retry_timer_op = None
+        if had_waits:
+            release_turn_blocker(state, "retry")
 
     def _handle_llm_failed(self, event: LLMFailed, state: State, emit: EmitFn) -> None:
         if event.context_limit:
@@ -307,8 +375,9 @@ class LiteLLMRateLimitRetryHandler:
             state.retry_timer_op = None
             state.io.cancel(existing_retry_op)
 
-        self._event_seq += 1
-        source_event_id = str(event.request_id or f"llm_failed_{self._event_seq}")
+        rt = self._runtime(state)
+        rt.event_seq += 1
+        source_event_id = str(event.request_id or f"llm_failed_{rt.event_seq}")
         wait_id = f"{source_event_id}:wait"
 
         store = _state_store(state)
@@ -328,7 +397,8 @@ class LiteLLMRateLimitRetryHandler:
         step_delay = min(self.tick_seconds, max(0.0, parsed.delay_seconds))
         op_id = state.io.submit(StartTimer(delay_s=float(step_delay)), tag="retry")
         state.retry_timer_op = op_id
-        self._active_waits[op_id] = {
+        acquire_turn_blocker(state, "retry", "Waiting for provider rate-limit reset")
+        rt.active_waits[op_id] = {
             "source_event_id": source_event_id,
             "wait_id": wait_id,
             "deadline": parsed.deadline,
@@ -349,7 +419,8 @@ class LiteLLMRateLimitRetryHandler:
         emit(ProjectionRequested())
 
     def _handle_timer_fired(self, event: TimerFired, state: State, emit: EmitFn) -> None:
-        wait = self._active_waits.pop(event.op_id, None)
+        rt = self._runtime(state)
+        wait = rt.active_waits.pop(event.op_id, None)
         if wait is None:
             return
 
@@ -363,6 +434,7 @@ class LiteLLMRateLimitRetryHandler:
             or getattr(state, "done", False)
             or getattr(state, "active_llm", None) is not None
         ):
+            release_turn_blocker(state, "retry")
             return
 
         now = event.ts if event.ts else (wait["last_ts"] + wait["step_delay"])
@@ -389,16 +461,16 @@ class LiteLLMRateLimitRetryHandler:
 
         state.dirty = True
         if done:
+            release_turn_blocker(state, "retry")
             emit(SetStatus(active=True, label="LiteLLM rate limit wait complete; retrying now"))
             emit(ProjectionRequested())
-            emit(RenderRequested())
-            emit(BeforeLLM())
+            emit(PacingCheck(reason="retry_timer"))
             return
 
         next_step = min(self.tick_seconds, remaining)
         next_op = state.io.submit(StartTimer(delay_s=float(next_step)), tag="retry")
         state.retry_timer_op = next_op
-        self._active_waits[next_op] = {
+        rt.active_waits[next_op] = {
             "source_event_id": source_event_id,
             "wait_id": wait_id,
             "deadline": wait["deadline"],
@@ -851,6 +923,10 @@ def _status_text(remaining_seconds: float) -> str:
 
 
 def _state_store(state) -> dict[str, Any]:
+    durable_fn = getattr(state, "durable", None)
+    if callable(durable_fn):
+        durable = durable_fn(PLUGIN_NAME, RateLimitRetryState)
+        return {"version": durable.version, "captures": durable.captures}
     current = getattr(state, STATE_ATTR, None)
     if not isinstance(current, dict):
         current = {}

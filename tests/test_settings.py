@@ -1,9 +1,11 @@
-"""Saved defaults, through the actual pipeline and registry."""
+"""Saved defaults, through the actual pipeline, SettingsRegistry, and PluginStoreDriver."""
 import json
 
 from agent_utils.core.pipeline import PipelineBuilder
 from agent_utils.core.session import Session
+from agent_zoo.durability import PluginStoreDriver, StoreUpdate
 from agent_zoo.features.settings import Setting, SettingsContext, SettingsRegistry
+from agent_zoo.testing import assert_pipeline_sans_io
 from litellm_rate_limit_retry_plugin import register_features, _defaults_path
 
 
@@ -12,6 +14,7 @@ def catalog(config):
     builder = PipelineBuilder()
     register_features(builder, session=session, config=config)
     session.pipeline = builder.build(suppress_warnings=True)
+    assert_pipeline_sans_io(session.pipeline)
     registry = SettingsRegistry([c for c in session.pipeline.components if isinstance(c, Setting)])
     ctx = SettingsContext(state=session.state, emit=lambda _ev: None)
     result = registry.handle({"type": "plugin_settings", "action": "list", "request_id": "test"}, ctx)
@@ -33,6 +36,11 @@ def test_defaults_writable_and_no_host_config_mutation(tmp_path, monkeypatch):
     result = registry.handle({"type": "plugin_settings", "action": "set", "request_id": "write",
                               "binding": registry.binding, "key": "rate_limit_retry.tick_ms", "value": 1500}, ctx)
     assert result["ok"]
+    # Drain deferred StoreUpdate through PluginStoreDriver (0.4.0 Sans-I/O persistence).
+    store_driver = PluginStoreDriver(state_root=tmp_path)
+    store_reqs = [eff.request for eff in ctx.state.io.take_outbox() if isinstance(eff.request, StoreUpdate)]
+    assert len(store_reqs) == 1
+    store_driver._execute(store_reqs[0])
     assert json.loads(_defaults_path().read_text())["litellm_rate_limit_retry"]["tick_seconds"] == 1.5
     assert config == {"unrelated": {"prompt": "untouched"}}
 

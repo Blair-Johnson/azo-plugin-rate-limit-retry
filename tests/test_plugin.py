@@ -358,9 +358,12 @@ def test_handler_llm_failed_stops_event_schedules_timer_and_stores_serializable_
     assert statuses and "retrying in 5s" in statuses[0].label
     notices = [ev for ev in emitted if isinstance(ev, EmitNotice)]
     assert notices and "retrying in 5s" in notices[0].text
-    stored = getattr(state, STATE_ATTR)["captures"]["evt-1"]
+    from litellm_rate_limit_retry_plugin import PLUGIN_NAME, RateLimitRetryState
+
+    stored = state.durable(PLUGIN_NAME, RateLimitRetryState).captures["evt-1"]
     assert stored["deadline"] == pytest.approx(RUNTIME_NOW + 5)
     assert "exception" not in stored
+    assert "retry" in getattr(state, "turn_blockers", {})
 
 
 def test_handler_ignores_unconfident_llm_failed():
@@ -398,20 +401,23 @@ def test_timer_tick_updates_status_and_triggers_retry_on_deadline():
     statuses = [ev for ev in emitted if isinstance(ev, SetStatus)]
     assert statuses[0].label == "LiteLLM rate limited; retrying in 2s"
     assert not any(isinstance(ev, BeforeLLM) for ev in emitted)
-    stored = getattr(state, STATE_ATTR)["captures"]["evt-1"]
+    from agent_zoo.events import PacingCheck
+    from litellm_rate_limit_retry_plugin import PLUGIN_NAME, RateLimitRetryState
+
+    stored = state.durable(PLUGIN_NAME, RateLimitRetryState).captures["evt-1"]
     assert stored["last_tick"]["remaining_seconds"] == pytest.approx(1.5)
     assert stored["last_tick"]["done"] is False
     second_op = state.io.take_outbox()[0].op_id
 
-    # Final tick at +2.5s (0s remaining -> emits RenderRequested + BeforeLLM)
+    # Final tick at +2.5s (0s remaining -> releases retry blocker and emits PacingCheck)
     emitted.clear()
     tick2 = TimerFired(op_id=second_op, ts=RUNTIME_NOW + 2.5)
     handler.handle(tick2, state, emitted.append)
     assert tick2.stopped is True
     statuses = [ev for ev in emitted if isinstance(ev, SetStatus)]
     assert statuses[0].label == "LiteLLM rate limit wait complete; retrying now"
-    assert any(isinstance(ev, RenderRequested) for ev in emitted)
-    assert any(isinstance(ev, BeforeLLM) for ev in emitted)
+    assert any(isinstance(ev, PacingCheck) and ev.reason == "retry_timer" for ev in emitted)
+    assert "retry" not in getattr(state, "turn_blockers", {})
     assert stored["last_tick"]["done"] is True
     assert state.io.take_outbox() == []
 
